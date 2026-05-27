@@ -118,6 +118,37 @@ def normalize_status(value: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Self-detection: when running inside a Fabric notebook, figure out the
+# current notebook + job-instance IDs so we never cancel ourselves.
+# ---------------------------------------------------------------------------
+
+def get_self_context() -> dict[str, str]:
+    """Return {'notebook_id', 'workspace_id', 'job_instance_id'} when running
+    inside a Fabric notebook. Empty dict otherwise."""
+    out: dict[str, str] = {}
+    try:
+        from notebookutils import mssparkutils  # type: ignore
+        ctx = getattr(mssparkutils.runtime, "context", None) or {}
+        # Different Fabric runtimes expose these under slightly different keys
+        # so try a handful.
+        for k in ("currentNotebookId", "notebookId"):
+            if ctx.get(k):
+                out["notebook_id"] = ctx[k]
+                break
+        for k in ("currentWorkspaceId", "workspaceId"):
+            if ctx.get(k):
+                out["workspace_id"] = ctx[k]
+                break
+        for k in ("activityId", "jobInstanceId", "runId"):
+            if ctx.get(k):
+                out["job_instance_id"] = ctx[k]
+                break
+    except Exception:  # noqa: BLE001 - not running in Fabric notebook
+        pass
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 
@@ -1012,6 +1043,22 @@ def run_once(
 
     elapsed = time.time() - t0
     print(f"\nScan finished in {elapsed:.1f}s. Found {len(all_active)} active job instance(s):")
+
+    # Self-protection: never cancel the notebook / job that's running this code.
+    self_ctx = get_self_context()
+    if self_ctx:
+        self_nb_id = self_ctx.get("notebook_id", "")
+        self_job_id = self_ctx.get("job_instance_id", "")
+        before = len(all_active)
+        all_active = [
+            j for j in all_active
+            if j.item_id != self_nb_id and j.instance_id != self_job_id
+        ]
+        skipped = before - len(all_active)
+        if skipped:
+            print(f"Self-protect: excluded {skipped} job(s) belonging to the "
+                  f"current notebook (item={self_nb_id[:8]}..., "
+                  f"job={self_job_id[:8] if self_job_id else 'N/A'}...).")
     print_table(all_active)
 
     selected = all_active
