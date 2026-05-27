@@ -23,7 +23,7 @@ If neither is available, the script falls back to shelling out to
 Usage
 -----
     # Cancel everything in-progress in a workspace
-    python cancel_in_progress_jobs.py -w "crestshield-smartclaims-sachinsaraf"
+    python cancel_in_progress_jobs.py -w "<your-workspace-name>"
 
     # Limit to specific items (by name OR GUID, repeatable)
     python cancel_in_progress_jobs.py -w ws -i "01_Bronze_Ingestion" -i "OfferProducerCatchup"

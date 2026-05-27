@@ -105,17 +105,17 @@ Upload `cancel_in_progress_jobs.py` to your notebook's working directory
 from cancel_in_progress_jobs import cancel_in_progress_jobs
 
 # Preview
-cancel_in_progress_jobs(workspace="crestshield-smartclaims-sachinsaraf", dry_run=True)
+cancel_in_progress_jobs(workspace="<your-workspace-name>", dry_run=True)
 
 # Cancel and verify
-cancel_in_progress_jobs(workspace="crestshield-smartclaims-sachinsaraf", poll=60)
+cancel_in_progress_jobs(workspace="<your-workspace-name>", poll=60)
 
 # Multi-workspace
-cancel_in_progress_jobs(workspace=["ws1", "ws2"], poll=60)
+cancel_in_progress_jobs(workspace=["<workspace-1>", "<workspace-2>"], poll=60)
 
 # Continuous loop (mirrors hfleitas/fabriciq pattern)
 cancel_in_progress_jobs(
-    workspace="crestshield-smartclaims-sachinsaraf",
+    workspace="<your-workspace-name>",
     loop=True, loop_duration=30, poll_interval=30,
     sleep_interval=0.1, poll=45,
 )
@@ -131,7 +131,7 @@ ready-to-import notebook with all recipes.
 
 ```bash
 # Cancel everything in-progress in a workspace, verify with poll
-python cancel_in_progress_jobs.py -w "crestshield-smartclaims-sachinsaraf" --poll 60
+python cancel_in_progress_jobs.py -w "<your-workspace-name>" --poll 60
 
 # Multi-workspace
 python cancel_in_progress_jobs.py -w ws1 -w ws2 --poll 60
