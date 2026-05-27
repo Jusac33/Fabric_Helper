@@ -2,9 +2,15 @@
 
 Operator scripts for Microsoft Fabric admins and power users.
 
-## Scripts
+## Files in this repo
 
-### `cancel_in_progress_jobs.py`
+| File | Use it when... |
+| --- | --- |
+| [`Cancel-In-Progress-Jobs.ipynb`](./Cancel-In-Progress-Jobs.ipynb) | **You want to run it from a notebook.** Self-contained: the full library is embedded as a single "paste-once" cell at the top, followed by recipe cells. Open in Fabric, Run All. No extra file upload needed. |
+| [`cancel_in_progress_jobs.py`](./cancel_in_progress_jobs.py) | **You want to run it from the terminal** (CLI), import it as a module in your own Python project, or schedule it (cron / Fabric pipeline / Azure DevOps). |
+| [`requirements.txt`](./requirements.txt) | `pip install -r requirements.txt` for CLI / local use. The notebook installs `requests` itself in its first cell. |
+
+## `cancel_in_progress_jobs.py` (library / CLI)
 
 Find every Fabric job (Notebook, DataPipeline, MLExperiment, Dataflow,
 SparkJobDefinition, Lakehouse table maintenance, ...) that is currently
