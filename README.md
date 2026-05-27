@@ -33,27 +33,33 @@ under the notebook's own identity - no `az login`, no token handling.
 3. Run cells **1 -> 3 -> 5** for a one-shot cancel pass, or also **7** for
    continuous monitoring (30 min default).
 
-### Scaling: capacity_filter, workspace_filter, and the safety gate
+### Scaling: capacity_filter, workspace_filter, and the tenant-wide fast path
 
 Top of cell 3 has three knobs:
 
 ```python
 workspace_filter: list[str] = []   # display names of specific workspaces
 capacity_filter:  list[str] = []   # capacity display names OR GUIDs
-WORKSPACE_PARALLELISM = 8          # workspaces scanned in parallel
-MAX_AUTO_WORKSPACES   = 50         # safety: refuse unfiltered scan above N
+WORKSPACE_PARALLELISM = 16         # workspaces scanned in parallel
+ACTIVITY_LOOKBACK_MIN = 60         # minutes (admin tenant-wide mode only)
 ```
 
 | Tenant size | Recommended setup |
 |---|---|
-| **Small** (< 50 workspaces) | Leave both filters empty - scans everything in parallel. |
-| **Large** (1000+ workspaces) | **Set `capacity_filter`** to the names or GUIDs of the capacity (or capacities) you want to drain. Most operational use case: a single overloaded capacity needs everything cancelled. |
+| **Small** (< 50 workspaces) | Leave both filters empty - per-workspace parallel scan works fine. |
+| **Large** (100s - 1000s of workspaces) | Either set `capacity_filter` to drain a single capacity, or leave both filters empty (Fabric Admin only) - the cell automatically uses the **Power BI Activity Events API**, one tenant-wide call. |
 | **Surgical** | Use `workspace_filter` with explicit workspace names. |
 
-If both filters are empty and the user has access to more than
-`MAX_AUTO_WORKSPACES` workspaces, the cell **aborts** with a message
-telling you to add a filter or raise the cap. This prevents an accidental
-1000-workspace serial scan that would take hours and hit rate limits.
+#### How "no filter" works
+
+- **If the user has Fabric Administrator role:** cell 3 calls
+  `GET /v1.0/myorg/admin/activityevents` **once** - this returns every
+  running notebook + pipeline activity tenant-wide in a single response.
+  Completes in ~5 seconds regardless of tenant size.
+- **If the user does not have Fabric Admin role:** the cell aborts with
+  a clear message asking you to set `workspace_filter` or
+  `capacity_filter` (because the per-workspace API approach would issue
+  thousands of calls and hit 429 throttling immediately on a large tenant).
 
 ### Targeting specific workspaces
 
@@ -61,7 +67,7 @@ telling you to add a filter or raise the cap. This prevents an accidental
 workspace_filter = ["my-prod-workspace", "another-workspace"]
 ```
 
-### Targeting a Fabric capacity (recommended for large tenants)
+### Targeting a Fabric capacity (recommended when many workspaces share one capacity)
 
 ```python
 capacity_filter = ["my-overloaded-capacity"]
