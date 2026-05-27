@@ -825,11 +825,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--admin", action="store_true",
                    help="Enumerate workspaces tenant-wide via Admin APIs "
                         "(requires Fabric Administrator role).")
-    p.add_argument("--use-activity-events", action="store_true",
+    p.add_argument("--use-activity-events", action=argparse.BooleanOptionalAction,
+                   default=True,
                    help="FAST tenant-wide discovery via Power BI "
                         "/admin/activityevents (one call instead of "
-                        "per-workspace scanning). Requires Fabric Admin role. "
-                        "Adapted from hfleitas/fabriciq.")
+                        "per-workspace scanning). DEFAULT for tenant admins. "
+                        "Disable with --no-use-activity-events.")
     p.add_argument("--activity-lookback", type=int, default=60, metavar="MINUTES",
                    help="Look back this many minutes for activity events "
                         "(default: 60; max 1440 per API).")
@@ -1049,7 +1050,7 @@ def cancel_in_progress_jobs(
     exclude_item: list[str] | None = None,
     exclude_workspace: list[str] | None = None,
     admin: bool = False,
-    use_activity_events: bool = False,
+    use_activity_events: bool = True,
     activity_lookback: int = 60,
     max_default_workspaces: int = 10,
     confirm_large_scan: bool = False,
@@ -1068,27 +1069,26 @@ def cancel_in_progress_jobs(
     verbose: bool = False,
     json_output: bool = False,
 ) -> dict:
-    """Programmatic entry point for Microsoft Fabric / Jupyter notebooks.
+    """Cancel in-progress Microsoft Fabric jobs (notebook + pipeline runs).
 
-    Default behavior with no arguments: scan every workspace the signed-in
-    user can access (mirrors the Fabric Monitor hub) and cancel any
-    in-progress job.
+    Default behavior (Fabric Admin recipient):
+        cancel_in_progress_jobs()                # tenant-wide via /admin/activityevents
+        cancel_in_progress_jobs(dry_run=True)    # preview only
 
-    Example (Fabric notebook):
-        from cancel_in_progress_jobs import cancel_in_progress_jobs
+    Targeted (non-admin, or specific workspaces):
+        cancel_in_progress_jobs(workspace="myws", poll=60)
+        cancel_in_progress_jobs(workspace=["ws1","ws2"], poll=60)
 
-        # Cancel everything in-progress across all your accessible
-        # workspaces (Monitor hub equivalent):
-        cancel_in_progress_jobs()
+    Per-workspace mode (no admin role available):
+        cancel_in_progress_jobs(use_activity_events=False, workspace="myws")
 
-        # Preview first:
-        cancel_in_progress_jobs(dry_run=True)
+    Continuous monitoring:
+        cancel_in_progress_jobs(
+            loop=True, loop_duration=30, poll_interval=30,
+            exclude_workspace=["Admin"], poll=45,
+        )
 
-        # Limit to specific workspaces:
-        cancel_in_progress_jobs(workspace=["ws1", "ws2"], poll=60)
-
-        # Tenant-wide (Fabric Admin required):
-        cancel_in_progress_jobs(use_activity_events=True, dry_run=True)
+    Returns the aggregated summary dict.
     """
     if isinstance(workspace, str):
         workspaces_arg = [workspace]
@@ -1137,32 +1137,36 @@ def _run_with_args(args: argparse.Namespace) -> dict:
     session.headers.update(auth_header(token))
 
     pbi_session: requests.Session | None = None
-    if args.use_activity_events:
+    # Only fetch PBI token if we'll actually use Activity Events.
+    if args.use_activity_events and not args.workspace:
         print("Acquiring Power BI admin token (for /admin/activityevents)...")
         pbi_session = requests.Session()
         pbi_session.headers.update(auth_header(get_powerbi_token()))
 
+    # Dispatch: explicit workspace arg always wins over activity-events default.
     if args.workspace:
         workspaces: list[dict] = []
         for w in args.workspace:
             ws_id, ws_name = resolve_workspace_id(session, w)
             workspaces.append({"id": ws_id, "displayName": ws_name})
+        # If the caller didn't explicitly opt into activity events, ensure we
+        # take the per-workspace path so pbi_session isn't required.
+        if args.use_activity_events:
+            print("(workspace= explicitly given, ignoring use_activity_events default)")
+            args.use_activity_events = False
     elif args.use_activity_events:
-        print("Using Activity Events for discovery -- no workspace pre-enumeration needed.")
+        print("Using Activity Events for tenant-wide discovery "
+              "(single /admin/activityevents call, Fabric Admin required).")
         workspaces = []
     elif args.admin:
         print("Enumerating ALL tenant workspaces via Admin API (requires Fabric Admin)...")
         workspaces = list_all_workspaces(session, admin=True)
     else:
         # Default: scan every workspace the signed-in user has access to.
-        # This mirrors the Microsoft Fabric Monitor hub, which shows
-        # "the activities across all the workspaces for which you have
-        # permissions within Microsoft Fabric."
-        print("Default mode: enumerating workspaces the signed-in user can see "
+        print("Enumerating workspaces the signed-in user can see "
               "(Monitor hub equivalent)...")
         workspaces = list_all_workspaces(session, admin=False)
 
-        # Safety gate: scanning many workspaces blows up API limits.
         if (len(workspaces) > args.max_default_workspaces
                 and not args.confirm_large_scan):
             ws_names = ", ".join(w["displayName"] for w in workspaces[:5])

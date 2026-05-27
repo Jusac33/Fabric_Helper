@@ -54,39 +54,34 @@ az login
 pip install -r requirements.txt
 ```
 
-#### Recommended for Fabric Admins (tenant-wide, one API call)
+#### Recommended for Fabric Admins (DEFAULT mode)
 
-If the person running this is a Fabric Administrator, the fastest and
-cleanest path is the Activity Events API — one tenant-wide call instead
-of fanning out per workspace:
+If the person running this is a Fabric Administrator, just call the
+function with no arguments - `use_activity_events=True` is the default,
+so a single tenant-wide API call (`GET /v1.0/myorg/admin/activityevents`)
+discovers every running notebook + pipeline run across the entire tenant
+in one request. No per-workspace fanout, no throttling.
 
 ```python
 from cancel_in_progress_jobs import cancel_in_progress_jobs
 
 # Preview first
-cancel_in_progress_jobs(use_activity_events=True, dry_run=True)
+cancel_in_progress_jobs(dry_run=True)
 
-# Cancel and verify
+# Cancel everything in-progress tenant-wide and verify
 cancel_in_progress_jobs(
-    use_activity_events=True,
-    activity_lookback=60,                       # minutes
-    exclude_workspace=["Admin", "Fabric Admin"], # safety: never touch
+    activity_lookback=60,                          # minutes to look back
+    exclude_workspace=["Admin", "Fabric Admin"],   # safety: never touch
     poll=60,
 )
 
 # Continuous monitoring for the next 30 minutes
 cancel_in_progress_jobs(
-    use_activity_events=True,
     loop=True, loop_duration=30, poll_interval=30,
     exclude_workspace=["Admin", "Fabric Admin"],
     sleep_interval=0.1,
 )
 ```
-
-This uses `GET https://api.powerbi.com/v1.0/myorg/admin/activityevents` —
-the same data source the Power BI Activity Events report uses — and returns
-notebook + pipeline runs in `InProgress`/`Running`/`Starting` state across
-the entire tenant in a single call.
 
 
 
