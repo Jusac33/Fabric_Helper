@@ -75,6 +75,13 @@ cancel_in_progress_jobs(
     poll=60,
 )
 
+# Explicit window (instead of activity_lookback)
+cancel_in_progress_jobs(
+    activity_start="2026-05-26T22:00:00Z",
+    activity_end="2026-05-26T23:00:00Z",
+    poll=60,
+)
+
 # Continuous monitoring for the next 30 minutes
 cancel_in_progress_jobs(
     loop=True, loop_duration=30, poll_interval=30,

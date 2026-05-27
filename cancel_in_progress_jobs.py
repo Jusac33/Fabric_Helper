@@ -480,16 +480,22 @@ def discover_via_activity_events(
     pbi_session: requests.Session,
     fabric_session: requests.Session,
     lookback_minutes: int,
+    start_iso: str | None = None,
+    end_iso: str | None = None,
 ) -> list[ActiveJob]:
     """Tenant-wide active-job discovery via Power BI Activity Events.
 
-    Returns ActiveJob entries for notebook + pipeline activities currently
-    in an active state within the last `lookback_minutes`.
+    If `start_iso` / `end_iso` are given they are used verbatim (must be
+    ISO-8601 UTC, same day, <=24h apart). Otherwise the window defaults
+    to `lookback_minutes` ending now.
     """
     from datetime import datetime, timezone, timedelta
-    now = datetime.now(timezone.utc).replace(microsecond=0)
-    start = (now - timedelta(minutes=lookback_minutes)).isoformat().replace("+00:00", "Z")
-    end = now.isoformat().replace("+00:00", "Z")
+    if start_iso and end_iso:
+        start, end = start_iso, end_iso
+    else:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        start = (now - timedelta(minutes=lookback_minutes)).isoformat().replace("+00:00", "Z")
+        end = now.isoformat().replace("+00:00", "Z")
 
     print(f"  Activity Events window: {start} -> {end}")
     events = list_activity_events(pbi_session, start, end)
@@ -833,7 +839,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "Disable with --no-use-activity-events.")
     p.add_argument("--activity-lookback", type=int, default=60, metavar="MINUTES",
                    help="Look back this many minutes for activity events "
-                        "(default: 60; max 1440 per API).")
+                        "(default: 60; max 1440 per API). Ignored if "
+                        "--activity-start / --activity-end are given.")
+    p.add_argument("--activity-start", type=str, default=None, metavar="ISO_UTC",
+                   dest="activity_start",
+                   help="Explicit start of activity-events window "
+                        "(e.g. 2026-05-26T22:00:00Z). Must be used with "
+                        "--activity-end. Window must be <=24h and same UTC day.")
+    p.add_argument("--activity-end", type=str, default=None, metavar="ISO_UTC",
+                   dest="activity_end",
+                   help="Explicit end of activity-events window. "
+                        "Used with --activity-start.")
     p.add_argument("--exclude-workspace", action="append", default=[],
                    dest="exclude_workspaces",
                    help="Skip workspaces with this display name (repeatable, "
@@ -946,11 +962,16 @@ def run_once(
 
     if args.use_activity_events and pbi_session is not None:
         # FAST PATH: one tenant-wide call to Activity Events.
-        print(f"Discovering active jobs via /admin/activityevents "
-              f"(lookback {args.activity_lookback} min)...")
+        if args.activity_start and args.activity_end:
+            print(f"Discovering active jobs via /admin/activityevents "
+                  f"(explicit window {args.activity_start} -> {args.activity_end})...")
+        else:
+            print(f"Discovering active jobs via /admin/activityevents "
+                  f"(lookback {args.activity_lookback} min)...")
         try:
             all_active = discover_via_activity_events(
                 pbi_session, session, args.activity_lookback,
+                start_iso=args.activity_start, end_iso=args.activity_end,
             )
         except SystemExit:
             raise
@@ -1052,6 +1073,8 @@ def cancel_in_progress_jobs(
     admin: bool = False,
     use_activity_events: bool = True,
     activity_lookback: int = 60,
+    activity_start: str | None = None,
+    activity_end: str | None = None,
     max_default_workspaces: int = 10,
     confirm_large_scan: bool = False,
     dry_run: bool = False,
@@ -1106,6 +1129,8 @@ def cancel_in_progress_jobs(
         admin=admin,
         use_activity_events=use_activity_events,
         activity_lookback=activity_lookback,
+        activity_start=activity_start,
+        activity_end=activity_end,
         max_default_workspaces=max_default_workspaces,
         confirm_large_scan=confirm_large_scan,
         dry_run=dry_run,
