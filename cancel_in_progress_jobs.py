@@ -801,8 +801,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("-w", "--workspace", action="append", default=[], required=False,
                    help="Workspace display name or GUID. Repeatable. "
-                        "REQUIRED unless --admin is set. Targets only the named "
-                        "workspaces -- does not scan the whole tenant.")
+                        "If omitted, scans every workspace the signed-in user "
+                        "has access to (mirrors the Fabric Monitor hub view).")
     p.add_argument("-i", "--item", action="append", default=[],
                    help="Restrict to items with this display name or GUID. "
                         "Repeatable. Wildcards (*, ?) and substring match supported.")
@@ -813,6 +813,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Skip items with this name or GUID. Repeatable. Wildcards supported.")
     p.add_argument("--interactive", action="store_true",
                    help="Show found jobs and ask which ones to cancel.")
+    p.add_argument("--max-default-workspaces", type=int, default=10,
+                   dest="max_default_workspaces",
+                   help="Safety cap on auto-discovered workspaces (default 10). "
+                        "If the user has access to more, refuse to scan unless "
+                        "--confirm-large-scan is set.")
+    p.add_argument("--confirm-large-scan", action="store_true",
+                   dest="confirm_large_scan",
+                   help="Acknowledge that you want to scan more than "
+                        "--max-default-workspaces workspaces (may hit 429s).")
     p.add_argument("--admin", action="store_true",
                    help="Enumerate workspaces tenant-wide via Admin APIs "
                         "(requires Fabric Administrator role).")
@@ -1042,6 +1051,8 @@ def cancel_in_progress_jobs(
     admin: bool = False,
     use_activity_events: bool = False,
     activity_lookback: int = 60,
+    max_default_workspaces: int = 10,
+    confirm_large_scan: bool = False,
     dry_run: bool = False,
     only_in_progress: bool = False,
     poll: int = 0,
@@ -1059,20 +1070,24 @@ def cancel_in_progress_jobs(
 ) -> dict:
     """Programmatic entry point for Microsoft Fabric / Jupyter notebooks.
 
-    Mirrors the CLI but takes keyword arguments instead of argv. Returns
-    the aggregated summary dict.
+    Default behavior with no arguments: scan every workspace the signed-in
+    user can access (mirrors the Fabric Monitor hub) and cancel any
+    in-progress job.
 
     Example (Fabric notebook):
         from cancel_in_progress_jobs import cancel_in_progress_jobs
-        summary = cancel_in_progress_jobs(
-            workspace="crestshield-smartclaims-sachinsaraf",
-            dry_run=True,
-        )
 
-    Cancel for real and verify:
+        # Cancel everything in-progress across all your accessible
+        # workspaces (Monitor hub equivalent):
+        cancel_in_progress_jobs()
+
+        # Preview first:
+        cancel_in_progress_jobs(dry_run=True)
+
+        # Limit to specific workspaces:
         cancel_in_progress_jobs(workspace=["ws1", "ws2"], poll=60)
 
-    Tenant-wide (Fabric Admin required):
+        # Tenant-wide (Fabric Admin required):
         cancel_in_progress_jobs(use_activity_events=True, dry_run=True)
     """
     if isinstance(workspace, str):
@@ -1091,6 +1106,8 @@ def cancel_in_progress_jobs(
         admin=admin,
         use_activity_events=use_activity_events,
         activity_lookback=activity_lookback,
+        max_default_workspaces=max_default_workspaces,
+        confirm_large_scan=confirm_large_scan,
         dry_run=dry_run,
         include_not_started=not only_in_progress,
         poll=poll,
@@ -1134,13 +1151,37 @@ def _run_with_args(args: argparse.Namespace) -> dict:
         print("Using Activity Events for discovery -- no workspace pre-enumeration needed.")
         workspaces = []
     elif args.admin:
-        print("No workspace given; enumerating tenant via Admin API...")
+        print("Enumerating ALL tenant workspaces via Admin API (requires Fabric Admin)...")
         workspaces = list_all_workspaces(session, admin=True)
     else:
-        print("ERROR: at least one workspace is required (or set admin=True / "
-              "use_activity_events=True for tenant-wide). Refusing to scan every "
-              "workspace by default.")
-        return {"error": "no_workspace"}
+        # Default: scan every workspace the signed-in user has access to.
+        # This mirrors the Microsoft Fabric Monitor hub, which shows
+        # "the activities across all the workspaces for which you have
+        # permissions within Microsoft Fabric."
+        print("Default mode: enumerating workspaces the signed-in user can see "
+              "(Monitor hub equivalent)...")
+        workspaces = list_all_workspaces(session, admin=False)
+
+        # Safety gate: scanning many workspaces blows up API limits.
+        if (len(workspaces) > args.max_default_workspaces
+                and not args.confirm_large_scan):
+            ws_names = ", ".join(w["displayName"] for w in workspaces[:5])
+            print()
+            print(f"!!! Found {len(workspaces)} accessible workspaces "
+                  f"(first 5: {ws_names}, ...).")
+            print(f"!!! Scanning that many will fan out thousands of API calls "
+                  f"and likely hit 429 throttling for many minutes.")
+            print(f"!!! Refusing to proceed. Options:")
+            print(f"!!!   1) Pass workspace=... (or -w on the CLI) to target "
+                  f"specific workspaces.")
+            print(f"!!!   2) Use use_activity_events=True (one tenant-wide call, "
+                  f"Fabric Admin only).")
+            print(f"!!!   3) Pass confirm_large_scan=True to proceed anyway "
+                  f"(slow + throttled).")
+            print(f"!!!   4) Raise max_default_workspaces=N (current default: "
+                  f"{args.max_default_workspaces}).")
+            return {"error": "too_many_workspaces",
+                    "workspace_count": len(workspaces)}
 
     if args.exclude_workspaces:
         excl = {e.lower() for e in args.exclude_workspaces}
