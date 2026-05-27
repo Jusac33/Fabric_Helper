@@ -81,12 +81,12 @@ cancel_in_progress_jobs(
     poll=60,
 )
 
-# Explicit window (instead of activity_lookback)
-cancel_in_progress_jobs(
-    activity_start="2026-05-26T22:00:00Z",
-    activity_end="2026-05-26T23:00:00Z",
-    poll=60,
-)
+# Explicit time window (computed dynamically)
+from datetime import datetime, timedelta, timezone
+now   = datetime.now(timezone.utc).replace(microsecond=0)
+start = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+end   = now.isoformat().replace("+00:00", "Z")
+cancel_in_progress_jobs(activity_start=start, activity_end=end, poll=60)
 
 # Continuous monitoring for the next 30 minutes
 cancel_in_progress_jobs(
@@ -99,7 +99,10 @@ cancel_in_progress_jobs(
 
 
 Upload `cancel_in_progress_jobs.py` to your notebook's working directory
-(or `%pip install` the helper) and call the Python API:
+(or use the self-contained [`Cancel-In-Progress-Jobs.ipynb`](./Cancel-In-Progress-Jobs.ipynb))
+and call the Python API. For Fabric Admins the headline call needs no
+workspace at all (see admin section above). For users **without** the
+Fabric Administrator role, target workspaces explicitly:
 
 ```python
 from cancel_in_progress_jobs import cancel_in_progress_jobs
@@ -113,19 +116,16 @@ cancel_in_progress_jobs(workspace="<your-workspace-name>", poll=60)
 # Multi-workspace
 cancel_in_progress_jobs(workspace=["<workspace-1>", "<workspace-2>"], poll=60)
 
-# Continuous loop (mirrors hfleitas/fabriciq pattern)
+# Continuous loop on a specific workspace
 cancel_in_progress_jobs(
     workspace="<your-workspace-name>",
     loop=True, loop_duration=30, poll_interval=30,
     sleep_interval=0.1, poll=45,
 )
-
-# Tenant-wide fast path (Fabric Admin required)
-cancel_in_progress_jobs(use_activity_events=True, exclude_workspace=["Admin"])
 ```
 
-See [`Cancel-In-Progress-Jobs.ipynb`](./Cancel-In-Progress-Jobs.ipynb) for a
-ready-to-import notebook with all recipes.
+See [`Cancel-In-Progress-Jobs.ipynb`](./Cancel-In-Progress-Jobs.ipynb) for
+the ready-to-import admin notebook (no workspace argument needed).
 
 #### Usage
 
