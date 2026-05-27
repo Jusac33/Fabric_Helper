@@ -79,7 +79,7 @@ from typing import Iterable
 
 import requests
 
-# Tunables — adjustable via CLI flags --sleep-interval and --max-retries.
+# Tunables -- adjustable via CLI flags --sleep-interval and --max-retries.
 CONFIG = {
     "sleep_interval": 0.0,   # seconds slept after every request (gentle pacing)
     "max_retries":    6,     # how many times to retry on 429/5xx
@@ -88,13 +88,23 @@ CONFIG = {
 }
 
 FABRIC_BASE = "https://api.fabric.microsoft.com/v1"
+PBI_ADMIN_BASE = "https://api.powerbi.com/v1.0/myorg/admin"
+
+# Power BI Activity Events that correspond to active Fabric jobs/sessions.
+# Adapted from hfleitas/fabriciq commit 22ef278.
+ACTIVITY_TYPES_NOTEBOOK = {
+    "UpdateNotebook", "ExecuteNotebookJob", "StartNotebookSession", "RunNotebook",
+}
+ACTIVITY_TYPES_PIPELINE = {
+    "ExecutePipeline", "RunDataPipeline", "StartPipeline", "DataPipelineRun",
+}
 
 # Status values that count as "active" / "in progress" in the Monitor hub.
 # Normalised to lowercase for matching (case-insensitive).
 ACTIVE_STATUSES = {"inprogress", "notstarted", "starting", "running", "unknown"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "canceled", "deduped"}
 
-# Item types known to never expose /jobs/instances — skip them silently.
+# Item types known to never expose /jobs/instances -- skip them silently.
 NO_JOBS_ITEM_TYPES = {
     "SQLEndpoint", "SQLAnalyticsEndpoint", "MountedWarehouse",
     "Dashboard", "PaginatedReport",
@@ -112,16 +122,21 @@ def normalize_status(value: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 def get_fabric_token() -> str:
-    """Return a bearer token for the Fabric API audience.
+    """Bearer token for Fabric API audience."""
+    return _get_token("https://api.fabric.microsoft.com/.default",
+                      cli_resource="https://api.fabric.microsoft.com")
 
-    1. Try DefaultAzureCredential (Azure SDK) — picks up `az login`, VS Code,
-       managed identity, env vars, etc.
-    2. Fall back to shelling out to `az account get-access-token`.
-    """
-    scope = "https://api.fabric.microsoft.com/.default"
+
+def get_powerbi_token() -> str:
+    """Bearer token for Power BI / analysis.windows.net audience (admin APIs)."""
+    return _get_token("https://analysis.windows.net/powerbi/api/.default",
+                      cli_resource="https://analysis.windows.net/powerbi/api")
+
+
+def _get_token(scope: str, *, cli_resource: str) -> str:
+    """Return a bearer token via DefaultAzureCredential, falling back to `az`."""
     try:
         from azure.identity import DefaultAzureCredential  # type: ignore
-
         cred = DefaultAzureCredential(exclude_interactive_browser_credential=False)
         return cred.get_token(scope).token
     except Exception as exc:  # noqa: BLE001
@@ -130,7 +145,7 @@ def get_fabric_token() -> str:
     try:
         result = subprocess.run(
             ["az", "account", "get-access-token",
-             "--resource", "https://api.fabric.microsoft.com",
+             "--resource", cli_resource,
              "--query", "accessToken", "-o", "tsv"],
             capture_output=True, text=True, check=True, shell=True,
         )
@@ -184,7 +199,7 @@ def request_with_retry(
             time.sleep(wait)
             continue
 
-        # 429 — Throttled. Wait the server-instructed amount then retry.
+        # 429 -- Throttled. Wait the server-instructed amount then retry.
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After", "")
             wait = _parse_retry_after(retry_after) or min(
@@ -196,7 +211,7 @@ def request_with_retry(
             time.sleep(wait)
             continue
 
-        # 5xx — transient, retry with backoff.
+        # 5xx -- transient, retry with backoff.
         if 500 <= resp.status_code < 600:
             wait = min(
                 CONFIG["backoff_max"],
@@ -240,6 +255,20 @@ def _parse_retry_after(value: str) -> float | None:
 # ---------------------------------------------------------------------------
 # Fabric REST helpers
 # ---------------------------------------------------------------------------
+
+@dataclass
+class ActiveJob:
+    workspace_id: str
+    workspace_name: str
+    item_id: str
+    item_name: str
+    item_type: str
+    instance_id: str
+    job_type: str
+    status: str
+    start_time: str
+    invoke_type: str
+
 
 def get_paged(session: requests.Session, url: str) -> list[dict]:
     """GET with continuationToken/continuationUri pagination and 429 retry."""
@@ -294,21 +323,185 @@ def list_items(session: requests.Session, ws_id: str) -> list[dict]:
     return get_paged(session, f"{FABRIC_BASE}/workspaces/{ws_id}/items")
 
 
-def list_job_instances(session: requests.Session, ws_id: str, item_id: str) -> list[dict]:
-    return get_paged(
-        session, f"{FABRIC_BASE}/workspaces/{ws_id}/items/{item_id}/jobs/instances"
-    )
+def list_job_instances(
+    session: requests.Session,
+    ws_id: str,
+    item_id: str,
+    *,
+    active_only: bool = False,
+    active_statuses: set[str] | None = None,
+) -> list[dict]:
+    """List job instances for an item.
+
+    `/jobs/instances` returns runs newest-first. When `active_only=True` we
+    page through results but stop as soon as we see a page containing zero
+    active statuses -- old terminal runs aren't worth fetching.
+    """
+    url = f"{FABRIC_BASE}/workspaces/{ws_id}/items/{item_id}/jobs/instances"
+    if not active_only:
+        return get_paged(session, url)
+
+    out: list[dict] = []
+    next_url: str | None = url
+    while next_url:
+        r = request_with_retry(session, "GET", next_url)
+        r.raise_for_status()
+        body = r.json()
+        page = body.get("value", [])
+        out.extend(page)
+        page_has_active = any(
+            normalize_status(inst.get("status")) in (active_statuses or ACTIVE_STATUSES)
+            for inst in page
+        )
+        if not page_has_active:
+            break
+        cont_uri = body.get("continuationUri")
+        cont_token = body.get("continuationToken")
+        if cont_uri:
+            next_url = cont_uri
+        elif cont_token:
+            sep = "&" if "?" in url else "?"
+            next_url = f"{url}{sep}continuationToken={cont_token}"
+        else:
+            next_url = None
+    return out
 
 
 def cancel_job_instance(
     session: requests.Session, ws_id: str, item_id: str, instance_id: str
 ) -> tuple[int, str]:
-    url = (
-        f"{FABRIC_BASE}/workspaces/{ws_id}/items/{item_id}"
-        f"/jobs/instances/{instance_id}/cancel"
+    """Cancel a job instance. Tries `/jobs/instances/.../cancel` first,
+    falls back to `/jobInstances/.../cancel` for older items.
+    (Dual-URL pattern from hfleitas/fabriciq.)
+    """
+    urls = [
+        f"{FABRIC_BASE}/workspaces/{ws_id}/items/{item_id}/jobs/instances/{instance_id}/cancel",
+        f"{FABRIC_BASE}/workspaces/{ws_id}/items/{item_id}/jobInstances/{instance_id}/cancel",
+    ]
+    last_resp: requests.Response | None = None
+    for url in urls:
+        r = request_with_retry(session, "POST", url)
+        if 200 <= r.status_code < 300:
+            return r.status_code, (r.text or "").strip()
+        last_resp = r
+    return last_resp.status_code, (last_resp.text or "").strip()  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# Power BI Admin Activity Events -- single tenant-wide call to discover
+# running notebooks/pipelines without enumerating every item per workspace.
+# Pattern from hfleitas/fabriciq commit 22ef278 ("fixes for activityevents api").
+# Requires Fabric Administrator role.
+# ---------------------------------------------------------------------------
+
+def list_activity_events(
+    pbi_session: requests.Session,
+    start_time_utc: str,
+    end_time_utc: str,
+    activity_filter: str | None = None,
+) -> list[dict]:
+    """Page through /admin/activityevents for a given window.
+
+    start_time_utc / end_time_utc must be ISO-8601 in single quotes per the
+    Power BI API spec; window must be <= 24 hours.
+    """
+    quoted_start = f"'{start_time_utc}'"
+    quoted_end = f"'{end_time_utc}'"
+    base = (f"{PBI_ADMIN_BASE}/activityevents"
+            f"?startDateTime={quoted_start}&endDateTime={quoted_end}")
+    if activity_filter:
+        base += f"&$filter={activity_filter}"
+
+    events: list[dict] = []
+    next_url: str | None = base
+    while next_url:
+        r = request_with_retry(pbi_session, "GET", next_url)
+        if r.status_code == 401:
+            raise SystemExit(
+                "ERROR: /admin/activityevents returned 401. "
+                "This API requires the Fabric Administrator role."
+            )
+        r.raise_for_status()
+        body = r.json()
+        events.extend(body.get("activityEventEntities", body.get("value", [])))
+        next_url = body.get("continuationUri")
+    return events
+
+
+def activity_to_active_job(
+    activity: dict, ws_lookup: dict[str, str]
+) -> ActiveJob | None:
+    """Map a Power BI activity event into our ActiveJob shape, if it represents
+    an active notebook session, notebook job, or pipeline run."""
+    status_norm = normalize_status(activity.get("Status"))
+    if status_norm not in ACTIVE_STATUSES:
+        return None
+
+    a_type = activity.get("Activity") or activity.get("OperationName") or ""
+    if a_type in ACTIVITY_TYPES_NOTEBOOK:
+        item_kind = "Notebook"
+    elif a_type in ACTIVITY_TYPES_PIPELINE:
+        item_kind = "DataPipeline"
+    else:
+        return None
+
+    ws_id = activity.get("WorkspaceId") or activity.get("WorkSpaceId") or ""
+    return ActiveJob(
+        workspace_id=ws_id,
+        workspace_name=ws_lookup.get(ws_id, ws_id),
+        item_id=activity.get("ItemId") or activity.get("ObjectId") or "",
+        item_name=activity.get("ItemName") or activity.get("ObjectId") or "",
+        item_type=item_kind,
+        instance_id=activity.get("Id") or "",
+        job_type=a_type,
+        status=activity.get("Status", "InProgress"),
+        start_time=activity.get("CreationTime") or activity.get("EventTime", ""),
+        invoke_type="Activity",
     )
-    r = request_with_retry(session, "POST", url)
-    return r.status_code, (r.text or "").strip()
+
+
+def discover_via_activity_events(
+    pbi_session: requests.Session,
+    fabric_session: requests.Session,
+    lookback_minutes: int,
+) -> list[ActiveJob]:
+    """Tenant-wide active-job discovery via Power BI Activity Events.
+
+    Returns ActiveJob entries for notebook + pipeline activities currently
+    in an active state within the last `lookback_minutes`.
+    """
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    start = (now - timedelta(minutes=lookback_minutes)).isoformat().replace("+00:00", "Z")
+    end = now.isoformat().replace("+00:00", "Z")
+
+    print(f"  Activity Events window: {start} -> {end}")
+    events = list_activity_events(pbi_session, start, end)
+    print(f"  Activity events returned: {len(events)}")
+
+    # Build a workspace-id → display-name lookup (for prettier output).
+    ws_lookup: dict[str, str] = {}
+    try:
+        groups = get_paged(pbi_session, f"{PBI_ADMIN_BASE}/groups?%24top=5000")
+        ws_lookup = {
+            g["id"]: (g.get("name") or g.get("displayName") or g["id"])
+            for g in groups if g.get("id")
+        }
+    except requests.HTTPError:
+        pass
+
+    out: list[ActiveJob] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for ev in events:
+        job = activity_to_active_job(ev, ws_lookup)
+        if job is None:
+            continue
+        key = (job.item_id, job.instance_id)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        out.append(job)
+    return out
 
 
 def get_job_instance(
@@ -358,20 +551,6 @@ def stop_notebook_session(
 # Core logic
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ActiveJob:
-    workspace_id: str
-    workspace_name: str
-    item_id: str
-    item_name: str
-    item_type: str
-    instance_id: str
-    job_type: str
-    status: str
-    start_time: str
-    invoke_type: str
-
-
 def collect_active_jobs(
     session: requests.Session,
     ws_id: str,
@@ -388,7 +567,10 @@ def collect_active_jobs(
         if item.get("type") in NO_JOBS_ITEM_TYPES:
             return []
         try:
-            instances = list_job_instances(session, ws_id, item["id"])
+            instances = list_job_instances(
+                session, ws_id, item["id"],
+                active_only=True, active_statuses=active_statuses,
+            )
         except requests.HTTPError as exc:
             code = exc.response.status_code if exc.response is not None else 0
             if code in (400, 403, 404):
@@ -604,7 +786,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("-w", "--workspace", action="append", default=[], required=False,
                    help="Workspace display name or GUID. Repeatable. "
                         "REQUIRED unless --admin is set. Targets only the named "
-                        "workspaces — does not scan the whole tenant.")
+                        "workspaces -- does not scan the whole tenant.")
     p.add_argument("-i", "--item", action="append", default=[],
                    help="Restrict to items with this display name or GUID. "
                         "Repeatable. Wildcards (*, ?) and substring match supported.")
@@ -618,6 +800,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--admin", action="store_true",
                    help="Enumerate workspaces tenant-wide via Admin APIs "
                         "(requires Fabric Administrator role).")
+    p.add_argument("--use-activity-events", action="store_true",
+                   help="FAST tenant-wide discovery via Power BI "
+                        "/admin/activityevents (one call instead of "
+                        "per-workspace scanning). Requires Fabric Admin role. "
+                        "Adapted from hfleitas/fabriciq.")
+    p.add_argument("--activity-lookback", type=int, default=60, metavar="MINUTES",
+                   help="Look back this many minutes for activity events "
+                        "(default: 60; max 1440 per API).")
+    p.add_argument("--exclude-workspace", action="append", default=[],
+                   dest="exclude_workspaces",
+                   help="Skip workspaces with this display name (repeatable, "
+                        "case-insensitive). E.g. --exclude-workspace Admin")
     p.add_argument("--dry-run", action="store_true",
                    help="List in-progress jobs but do not cancel them")
     p.add_argument("--include-not-started", dest="include_not_started",
@@ -629,7 +823,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--poll", type=int, default=0,
                    help="Seconds to poll for final status after cancel (default: 0)")
     p.add_argument("--concurrency", type=int, default=16,
-                   help="Parallel cancel/list requests (default: 16)")
+                   help="Parallel items-per-workspace requests (default: 16)")
+    p.add_argument("--workspace-concurrency", type=int, default=8, dest="workspace_concurrency",
+                   help="Parallel workspaces to scan at once (default: 8). "
+                        "Raise for many workspaces; lower if you hit 429s.")
     p.add_argument("--verbose", action="store_true",
                    help="Print noisy per-item warnings (403/404 on items that "
                         "do not expose jobs/instances).")
@@ -638,7 +835,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # ---- API throttling controls (adapted from fabriciq notebook) ----
     p.add_argument("--sleep-interval", type=float, default=0.0, metavar="SECONDS",
                    help="Sleep this long after every API call to pace requests "
-                        "(default: 0 — only sleep on 429). Use 0.05-0.25 to be gentle.")
+                        "(default: 0 -- only sleep on 429). Use 0.05-0.25 to be gentle.")
     p.add_argument("--max-retries", type=int, default=6,
                    help="Max retries on HTTP 429 / 5xx (default: 6). Honors Retry-After.")
 
@@ -682,47 +879,100 @@ def _build_status_set(include_not_started: bool) -> set[str]:
     return s
 
 
+def _scan_workspace(
+    session: requests.Session,
+    ws: dict,
+    statuses: set[str],
+    args: argparse.Namespace,
+) -> tuple[dict, list[ActiveJob], list[dict]]:
+    """Scan one workspace and return (info, active jobs, items)."""
+    ws_id, ws_name = ws["id"], ws["displayName"]
+    info: dict = {"ws_id": ws_id, "ws_name": ws_name, "items": 0, "filtered": 0,
+                  "active": 0, "skipped": False, "error": ""}
+    try:
+        items = list_items(session, ws_id)
+    except requests.HTTPError as exc:
+        info["skipped"] = True
+        info["error"] = f"HTTP {exc.response.status_code if exc.response is not None else '?'}"
+        return info, [], []
+    info["items"] = len(items)
+    filtered = filter_items(items, args.item, args.item_types, args.exclude_items)
+    info["filtered"] = len(filtered)
+    active = collect_active_jobs(
+        session, ws_id, ws_name, filtered, statuses, args.concurrency, args.verbose,
+    )
+    info["active"] = len(active)
+    return info, active, items
+
+
 def run_once(
     session: requests.Session,
     workspaces: list[dict],
     args: argparse.Namespace,
+    pbi_session: requests.Session | None = None,
 ) -> dict:
     """One full scan + cancel pass. Returns a summary dict."""
     statuses = _build_status_set(args.include_not_started)
     all_active: list[ActiveJob] = []
     items_by_workspace: dict[str, list[dict]] = {}
 
-    for idx, ws in enumerate(workspaces, 1):
-        ws_id, ws_name = ws["id"], ws["displayName"]
-        try:
-            items = list_items(session, ws_id)
-        except requests.HTTPError as exc:
-            code = exc.response.status_code if exc.response is not None else 0
-            print(f"  [{idx}/{len(workspaces)}] {ws_name:<40}  skipped (HTTP {code})")
-            continue
-        items_by_workspace[ws_id] = items
-        filtered = filter_items(items, args.item, args.item_types, args.exclude_items)
-        active = collect_active_jobs(
-            session, ws_id, ws_name, filtered, statuses, args.concurrency, args.verbose,
-        )
-        scope = (
-            f"items={len(filtered)}/{len(items)}"
-            if (args.item or args.item_types or args.exclude_items)
-            else f"items={len(items)}"
-        )
-        marker = f"  ACTIVE: {len(active)}" if active else ""
-        print(f"  [{idx}/{len(workspaces)}] {ws_name:<40}  {scope:<14}{marker}")
-        all_active.extend(active)
+    t0 = time.time()
 
-    print(f"\nFound {len(all_active)} active job instance(s):")
+    if args.use_activity_events and pbi_session is not None:
+        # FAST PATH: one tenant-wide call to Activity Events.
+        print(f"Discovering active jobs via /admin/activityevents "
+              f"(lookback {args.activity_lookback} min)...")
+        try:
+            all_active = discover_via_activity_events(
+                pbi_session, session, args.activity_lookback,
+            )
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ! Activity Events discovery failed: {exc}")
+            print("  Falling back to per-workspace scan...")
+            args.use_activity_events = False
+
+        if args.exclude_workspaces:
+            excl = {e.lower() for e in args.exclude_workspaces}
+            before = len(all_active)
+            all_active = [j for j in all_active if j.workspace_name.lower() not in excl]
+            print(f"  Excluded {before - len(all_active)} job(s) from excluded workspaces.")
+
+    if not args.use_activity_events:
+        # ORIGINAL PATH: per-workspace, per-item parallel scan.
+        print(f"Scanning {len(workspaces)} workspace(s) with workspace-parallelism="
+              f"{args.workspace_concurrency}, item-parallelism={args.concurrency}...")
+
+        with ThreadPoolExecutor(max_workers=args.workspace_concurrency) as pool:
+            futures = {pool.submit(_scan_workspace, session, ws, statuses, args): ws
+                       for ws in workspaces}
+            for idx, fut in enumerate(as_completed(futures), 1):
+                info, active, items = fut.result()
+                items_by_workspace[info["ws_id"]] = items
+                if info["skipped"]:
+                    print(f"  [{idx}/{len(workspaces)}] {info['ws_name']:<40}  "
+                          f"skipped ({info['error']})")
+                    continue
+                if args.item or args.item_types or args.exclude_items:
+                    scope = f"items={info['filtered']}/{info['items']}"
+                else:
+                    scope = f"items={info['items']}"
+                marker = f"  ACTIVE: {info['active']}" if info["active"] else ""
+                print(f"  [{idx}/{len(workspaces)}] {info['ws_name']:<40}  "
+                      f"{scope:<14}{marker}")
+                all_active.extend(active)
+
+    elapsed = time.time() - t0
+    print(f"\nScan finished in {elapsed:.1f}s. Found {len(all_active)} active job instance(s):")
     print_table(all_active)
 
     selected = all_active
     if args.interactive and selected:
         selected = interactive_pick(selected)
         if not selected:
-            print("Nothing selected — exiting iteration.")
-            return {"found": len(all_active), "cancelled": 0}
+            print("Nothing selected -- exiting iteration.")
+            return {"found": len(all_active), "cancelled": 0, "scan_seconds": elapsed}
 
     cancel_succeeded: list[ActiveJob] = []
     cancel_failed: list[tuple[ActiveJob, int, str]] = []
@@ -740,7 +990,6 @@ def run_once(
     elif selected and args.dry_run:
         print("\n--dry-run set: no cancellations issued.")
 
-    # Optionally stop live notebook Spark sessions.
     session_seen = session_stopped = 0
     if args.stop_notebook_sessions:
         print("\nScanning notebook Spark sessions...")
@@ -763,6 +1012,7 @@ def run_once(
         "cancel_failed": len(cancel_failed),
         "notebook_sessions_seen": session_seen,
         "notebook_sessions_stopped": session_stopped,
+        "scan_seconds": elapsed,
     }
 
 
@@ -778,19 +1028,40 @@ def main(argv: list[str] | None = None) -> int:
     session = requests.Session()
     session.headers.update(auth_header(token))
 
+    # If using Activity Events, get a Power BI token too.
+    pbi_session: requests.Session | None = None
+    if args.use_activity_events:
+        print("Acquiring Power BI admin token (for /admin/activityevents)...")
+        pbi_session = requests.Session()
+        pbi_session.headers.update(auth_header(get_powerbi_token()))
+
     # Decide which workspaces to scan.
     if args.workspace:
         workspaces: list[dict] = []
         for w in args.workspace:
             ws_id, ws_name = resolve_workspace_id(session, w)
             workspaces.append({"id": ws_id, "displayName": ws_name})
+    elif args.use_activity_events:
+        # Activity Events returns workspaceId per event; we don't need to
+        # pre-enumerate workspaces. Workspace names are resolved lazily.
+        print("Using Activity Events for discovery -- no workspace pre-enumeration needed.")
+        workspaces = []
     elif args.admin:
-        print("No --workspace given; enumerating tenant (admin)...")
+        print("No --workspace given; enumerating tenant via Admin API...")
         workspaces = list_all_workspaces(session, admin=True)
     else:
         print("ERROR: at least one --workspace / -w is required (or use --admin "
-              "for tenant-wide). Refusing to scan every workspace by default.")
+              "/ --use-activity-events for tenant-wide). Refusing to scan every "
+              "workspace by default.")
         return 2
+
+    # Apply --exclude-workspace filter.
+    if args.exclude_workspaces:
+        excl = {e.lower() for e in args.exclude_workspaces}
+        before = len(workspaces)
+        workspaces = [w for w in workspaces if w["displayName"].lower() not in excl]
+        print(f"Excluded {before - len(workspaces)} workspace(s) by name "
+              f"(matched {args.exclude_workspaces}).")
 
     print(f"Workspaces in scope:        {len(workspaces)}")
     statuses = _build_status_set(args.include_not_started)
@@ -813,7 +1084,7 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     if not args.loop:
-        summary = run_once(session, workspaces, args)
+        summary = run_once(session, workspaces, args, pbi_session)
         aggregated["iterations"] = 1
         aggregated["found_total"] = summary.get("found", 0)
         aggregated["cancel_succeeded_total"] = summary.get("cancel_succeeded", 0)
@@ -828,7 +1099,7 @@ def main(argv: list[str] | None = None) -> int:
             print("\n" + "=" * 100)
             remaining = int(deadline - time.time())
             print(f"[LOOP] iteration {aggregated['iterations']}  (remaining: {remaining}s)")
-            summary = run_once(session, workspaces, args)
+            summary = run_once(session, workspaces, args, pbi_session)
             aggregated["found_total"] += summary.get("found", 0)
             aggregated["cancel_succeeded_total"] += summary.get("cancel_succeeded", 0)
             aggregated["cancel_failed_total"] += summary.get("cancel_failed", 0)

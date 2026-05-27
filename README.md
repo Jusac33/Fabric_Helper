@@ -14,20 +14,31 @@ cancel it.
 
 #### Highlights
 
-- **All item types** — iterates `/v1/workspaces/{ws}/items` and calls
+- **All item types** - iterates `/v1/workspaces/{ws}/items` and calls
   `/jobs/instances` per item. Not notebook-specific.
-- **Targeted by default** — `-w` is required (repeatable). Use `--admin`
-  for explicit tenant-wide scope via the Admin APIs.
-- **Item filters** — `-i name|guid` (wildcards), `--item-type`,
-  `--exclude-item`, and an `--interactive` numbered picker.
-- **API throttling** — retries on HTTP `429` honoring `Retry-After`,
+- **Targeted by default** - `-w` is required (repeatable). Use `--admin`
+  for tenant-wide via Admin APIs, or `--use-activity-events` for a single
+  tenant-wide call via Power BI `/admin/activityevents`.
+- **Fast tenant-wide path** - `--use-activity-events` calls Power BI's
+  `/admin/activityevents` once (instead of fanning out per workspace).
+  Requires Fabric Administrator role. Pattern from
+  [hfleitas/fabriciq commit 22ef278](https://github.com/hfleitas/fabriciq/commit/22ef278871c84b7ac42a5de266157bfd8cb2e407).
+- **Workspace-level parallelism** - `--workspace-concurrency` (default 8)
+  scans many workspaces in parallel; per-workspace items parallelised via
+  `--concurrency` (default 16).
+- **Item filters** - `-i name|guid` (wildcards), `--item-type`,
+  `--exclude-item`, `--exclude-workspace`, and an `--interactive`
+  numbered picker.
+- **API throttling** - retries on HTTP `429` honoring `Retry-After`,
   exponential backoff with jitter on `5xx`, optional `--sleep-interval`
   between calls.
-- **Continuous loop** — `--loop --loop-duration MIN --poll-interval SEC`
+- **Continuous loop** - `--loop --loop-duration MIN --poll-interval SEC`
   keeps cancelling new in-progress jobs that appear during the window.
-- **Notebook Spark sessions** — `--stop-notebook-sessions` also stops
+- **Notebook Spark sessions** - `--stop-notebook-sessions` also stops
   live Spark sessions left by notebook runs.
-- **Verification** — `--poll N` waits and reports the terminal status
+- **Dual-URL cancel** - tries both `/jobs/instances/{id}/cancel` and the
+  legacy `/jobInstances/{id}/cancel` for older items.
+- **Verification** - `--poll N` waits and reports the terminal status
   (`Cancelled` / `Completed` / `Failed`) of each cancelled job.
 
 #### Auth
@@ -50,8 +61,15 @@ python cancel_in_progress_jobs.py -w "crestshield-smartclaims-sachinsaraf" --pol
 # Multi-workspace
 python cancel_in_progress_jobs.py -w ws1 -w ws2 --poll 60
 
-# Tenant-wide (Fabric Admin only)
-python cancel_in_progress_jobs.py --admin --poll 60
+# Tenant-wide via Admin API (per-workspace fanout, parallel)
+python cancel_in_progress_jobs.py --admin --workspace-concurrency 16 --poll 60
+
+# FAST tenant-wide via Activity Events (one API call, requires Fabric Admin)
+python cancel_in_progress_jobs.py --use-activity-events --activity-lookback 60 --poll 60
+
+# Skip specific workspaces (admin/critical)
+python cancel_in_progress_jobs.py --admin \
+  --exclude-workspace "Admin" --exclude-workspace "Fabric Admin"
 
 # Preview only
 python cancel_in_progress_jobs.py -w ws --dry-run
@@ -79,12 +97,15 @@ python cancel_in_progress_jobs.py -w ws --stop-notebook-sessions
 
 | Flag | Purpose |
 | --- | --- |
-| `-w / --workspace` (repeat) | Workspace name or GUID. Required unless `--admin`. |
+| `-w / --workspace` (repeat) | Workspace name or GUID. Required unless `--admin` / `--use-activity-events`. |
 | `-i / --item` (repeat) | Restrict to items by name or GUID (wildcards / substring). |
 | `--item-type` (repeat) | Restrict to item type (Notebook, DataPipeline, ...). |
 | `--exclude-item` (repeat) | Skip items by name or GUID. |
+| `--exclude-workspace` (repeat) | Skip workspaces by display name (case-insensitive). |
 | `--interactive` | Numbered picker for the discovered jobs. |
-| `--admin` | Tenant-wide via Admin APIs. |
+| `--admin` | Tenant-wide via Admin APIs (per-workspace scan, parallel). |
+| `--use-activity-events` | FAST: tenant-wide via Power BI `/admin/activityevents` (one call). |
+| `--activity-lookback MIN` | Lookback window for activity events (default 60). |
 | `--dry-run` | Detect only; do not cancel. |
 | `--only-in-progress` | Skip NotStarted / Starting jobs. |
 | `--poll N` | After cancel, poll up to N seconds for terminal status. |
@@ -94,19 +115,26 @@ python cancel_in_progress_jobs.py -w ws --stop-notebook-sessions
 | `--stop-notebook-sessions` | Also stop live notebook Spark sessions. |
 | `--sleep-interval SEC` | Pace between API calls. |
 | `--max-retries N` | Max retries on 429/5xx (default 6). |
-| `--concurrency K` | Parallel cancel/list requests (default 16). |
+| `--concurrency K` | Parallel items-per-workspace requests (default 16). |
+| `--workspace-concurrency K` | Parallel workspaces scanned at once (default 8). |
 | `--json` | Machine-readable summary. |
 | `--verbose` | Print noisy per-item warnings. |
 
 #### Required APIs
 
-- `GET  /v1/workspaces` — list workspaces
-- `GET  /v1/admin/workspaces` — tenant-wide (admin only)
-- `GET  /v1/workspaces/{ws}/items` — enumerate items
-- `GET  /v1/workspaces/{ws}/items/{id}/jobs/instances` — list job instances
-- `POST /v1/workspaces/{ws}/items/{id}/jobs/instances/{inst}/cancel` — cancel
-- `GET  /v1/workspaces/{ws}/notebooks/{nb}/sessions` — list Spark sessions
-- `POST /v1/workspaces/{ws}/notebooks/{nb}/sessions/{sid}/stop` — stop session
+Per-workspace (default):
+- `GET  /v1/workspaces` - list workspaces
+- `GET  /v1/admin/workspaces` - tenant-wide (admin only)
+- `GET  /v1/workspaces/{ws}/items` - enumerate items
+- `GET  /v1/workspaces/{ws}/items/{id}/jobs/instances` - list job instances
+- `POST /v1/workspaces/{ws}/items/{id}/jobs/instances/{inst}/cancel` - cancel
+- `POST /v1/workspaces/{ws}/items/{id}/jobInstances/{inst}/cancel` - legacy fallback
+- `GET  /v1/workspaces/{ws}/notebooks/{nb}/sessions` - list Spark sessions
+- `POST /v1/workspaces/{ws}/notebooks/{nb}/sessions/{sid}/stop` - stop session
+
+Fast tenant-wide mode (`--use-activity-events`, Fabric Admin required):
+- `GET  https://api.powerbi.com/v1.0/myorg/admin/activityevents` - one tenant-wide call
+- `GET  https://api.powerbi.com/v1.0/myorg/admin/groups` - workspace name lookup
 
 #### Credits
 
