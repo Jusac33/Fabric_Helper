@@ -45,12 +45,45 @@ cancel it.
 
 Uses `azure-identity` (`DefaultAzureCredential`) and falls back to
 `az account get-access-token --resource https://api.fabric.microsoft.com`.
+**Inside a Fabric notebook**, it auto-uses `notebookutils.mssparkutils.credentials.getToken(...)`
+(no `az login` needed).
 
 ```bash
-# one-time
+# one-time (terminal use)
 az login
 pip install -r requirements.txt
 ```
+
+#### Use from a Fabric notebook
+
+Upload `cancel_in_progress_jobs.py` to your notebook's working directory
+(or `%pip install` the helper) and call the Python API:
+
+```python
+from cancel_in_progress_jobs import cancel_in_progress_jobs
+
+# Preview
+cancel_in_progress_jobs(workspace="crestshield-smartclaims-sachinsaraf", dry_run=True)
+
+# Cancel and verify
+cancel_in_progress_jobs(workspace="crestshield-smartclaims-sachinsaraf", poll=60)
+
+# Multi-workspace
+cancel_in_progress_jobs(workspace=["ws1", "ws2"], poll=60)
+
+# Continuous loop (mirrors hfleitas/fabriciq pattern)
+cancel_in_progress_jobs(
+    workspace="crestshield-smartclaims-sachinsaraf",
+    loop=True, loop_duration=30, poll_interval=30,
+    sleep_interval=0.1, poll=45,
+)
+
+# Tenant-wide fast path (Fabric Admin required)
+cancel_in_progress_jobs(use_activity_events=True, exclude_workspace=["Admin"])
+```
+
+See [`Cancel-In-Progress-Jobs.ipynb`](./Cancel-In-Progress-Jobs.ipynb) for a
+ready-to-import notebook with all recipes.
 
 #### Usage
 

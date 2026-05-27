@@ -134,7 +134,22 @@ def get_powerbi_token() -> str:
 
 
 def _get_token(scope: str, *, cli_resource: str) -> str:
-    """Return a bearer token via DefaultAzureCredential, falling back to `az`."""
+    """Return a bearer token. Tries multiple sources in order:
+
+    1. Fabric notebook (`notebookutils.mssparkutils.credentials.getToken`) -
+       works automatically inside Microsoft Fabric notebooks.
+    2. `azure.identity.DefaultAzureCredential` - picks up `az login`,
+       VS Code, managed identity, env vars, etc.
+    3. Shell out to `az account get-access-token`.
+    """
+    # 1) Fabric notebook identity (no extra setup needed inside Fabric)
+    try:
+        from notebookutils import mssparkutils  # type: ignore
+        return mssparkutils.credentials.getToken(cli_resource)
+    except Exception:  # noqa: BLE001 - missing module, not running in Fabric notebook
+        pass
+
+    # 2) azure-identity
     try:
         from azure.identity import DefaultAzureCredential  # type: ignore
         cred = DefaultAzureCredential(exclude_interactive_browser_credential=False)
@@ -142,6 +157,7 @@ def _get_token(scope: str, *, cli_resource: str) -> str:
     except Exception as exc:  # noqa: BLE001
         print(f"  (azure-identity unavailable: {exc}; falling back to 'az' CLI)")
 
+    # 3) az CLI
     try:
         result = subprocess.run(
             ["az", "account", "get-access-token",
@@ -1016,10 +1032,85 @@ def run_once(
     }
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+def cancel_in_progress_jobs(
+    workspace: str | list[str] | None = None,
+    *,
+    item: list[str] | None = None,
+    item_type: list[str] | None = None,
+    exclude_item: list[str] | None = None,
+    exclude_workspace: list[str] | None = None,
+    admin: bool = False,
+    use_activity_events: bool = False,
+    activity_lookback: int = 60,
+    dry_run: bool = False,
+    only_in_progress: bool = False,
+    poll: int = 0,
+    loop: bool = False,
+    loop_duration: int = 30,
+    poll_interval: int = 30,
+    stop_notebook_sessions: bool = False,
+    sleep_interval: float = 0.0,
+    max_retries: int = 6,
+    concurrency: int = 16,
+    workspace_concurrency: int = 8,
+    interactive: bool = False,
+    verbose: bool = False,
+    json_output: bool = False,
+) -> dict:
+    """Programmatic entry point for Microsoft Fabric / Jupyter notebooks.
 
-    # Apply throttling tunables globally.
+    Mirrors the CLI but takes keyword arguments instead of argv. Returns
+    the aggregated summary dict.
+
+    Example (Fabric notebook):
+        from cancel_in_progress_jobs import cancel_in_progress_jobs
+        summary = cancel_in_progress_jobs(
+            workspace="crestshield-smartclaims-sachinsaraf",
+            dry_run=True,
+        )
+
+    Cancel for real and verify:
+        cancel_in_progress_jobs(workspace=["ws1", "ws2"], poll=60)
+
+    Tenant-wide (Fabric Admin required):
+        cancel_in_progress_jobs(use_activity_events=True, dry_run=True)
+    """
+    if isinstance(workspace, str):
+        workspaces_arg = [workspace]
+    elif workspace is None:
+        workspaces_arg = []
+    else:
+        workspaces_arg = list(workspace)
+
+    ns = argparse.Namespace(
+        workspace=workspaces_arg,
+        item=list(item or []),
+        item_types=list(item_type or []),
+        exclude_items=list(exclude_item or []),
+        exclude_workspaces=list(exclude_workspace or []),
+        admin=admin,
+        use_activity_events=use_activity_events,
+        activity_lookback=activity_lookback,
+        dry_run=dry_run,
+        include_not_started=not only_in_progress,
+        poll=poll,
+        loop=loop,
+        loop_duration=loop_duration,
+        poll_interval=poll_interval,
+        stop_notebook_sessions=stop_notebook_sessions,
+        sleep_interval=sleep_interval,
+        max_retries=max_retries,
+        concurrency=concurrency,
+        workspace_concurrency=workspace_concurrency,
+        interactive=interactive,
+        verbose=verbose,
+        json=json_output,
+    )
+    return _run_with_args(ns)
+
+
+def _run_with_args(args: argparse.Namespace) -> dict:
+    """Shared core used by main() (CLI) and cancel_in_progress_jobs() (notebook)."""
     CONFIG["sleep_interval"] = max(0.0, args.sleep_interval)
     CONFIG["max_retries"] = max(1, args.max_retries)
 
@@ -1028,34 +1119,29 @@ def main(argv: list[str] | None = None) -> int:
     session = requests.Session()
     session.headers.update(auth_header(token))
 
-    # If using Activity Events, get a Power BI token too.
     pbi_session: requests.Session | None = None
     if args.use_activity_events:
         print("Acquiring Power BI admin token (for /admin/activityevents)...")
         pbi_session = requests.Session()
         pbi_session.headers.update(auth_header(get_powerbi_token()))
 
-    # Decide which workspaces to scan.
     if args.workspace:
         workspaces: list[dict] = []
         for w in args.workspace:
             ws_id, ws_name = resolve_workspace_id(session, w)
             workspaces.append({"id": ws_id, "displayName": ws_name})
     elif args.use_activity_events:
-        # Activity Events returns workspaceId per event; we don't need to
-        # pre-enumerate workspaces. Workspace names are resolved lazily.
         print("Using Activity Events for discovery -- no workspace pre-enumeration needed.")
         workspaces = []
     elif args.admin:
-        print("No --workspace given; enumerating tenant via Admin API...")
+        print("No workspace given; enumerating tenant via Admin API...")
         workspaces = list_all_workspaces(session, admin=True)
     else:
-        print("ERROR: at least one --workspace / -w is required (or use --admin "
-              "/ --use-activity-events for tenant-wide). Refusing to scan every "
+        print("ERROR: at least one workspace is required (or set admin=True / "
+              "use_activity_events=True for tenant-wide). Refusing to scan every "
               "workspace by default.")
-        return 2
+        return {"error": "no_workspace"}
 
-    # Apply --exclude-workspace filter.
     if args.exclude_workspaces:
         excl = {e.lower() for e in args.exclude_workspaces}
         before = len(workspaces)
@@ -1089,7 +1175,9 @@ def main(argv: list[str] | None = None) -> int:
         aggregated["found_total"] = summary.get("found", 0)
         aggregated["cancel_succeeded_total"] = summary.get("cancel_succeeded", 0)
         aggregated["cancel_failed_total"] = summary.get("cancel_failed", 0)
-        aggregated["notebook_sessions_stopped_total"] = summary.get("notebook_sessions_stopped", 0)
+        aggregated["notebook_sessions_stopped_total"] = summary.get(
+            "notebook_sessions_stopped", 0
+        )
     else:
         deadline = time.time() + args.loop_duration * 60
         print(f"\n[LOOP] running for up to {args.loop_duration} min, "
@@ -1117,8 +1205,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nSummary: {aggregated}")
     if args.json:
         print(json.dumps(aggregated, default=str))
+    return aggregated
 
-    return 0 if aggregated["cancel_failed_total"] == 0 else 1
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    result = _run_with_args(args)
+    if result.get("error"):
+        return 2
+    return 0 if result.get("cancel_failed_total", 0) == 0 else 1
 
 
 if __name__ == "__main__":
